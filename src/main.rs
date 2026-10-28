@@ -401,6 +401,8 @@ async fn main() -> Result<()> {
         .env("OCFREE_SHIM_PORT", "8941")
         .env("OCFREE_SHIM_TOKEN", &shim_token)
         .env("HTTPS_PROXY", &cli.proxy)
+        .env("OCFREE_PROXIES", &cli.proxy)
+        .env("OCFREE_RETRIES", "3")
         .spawn()
         .expect("failed to spawn shim");
 

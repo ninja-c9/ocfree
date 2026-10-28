@@ -47,3 +47,10 @@ curl -s http://127.0.0.1:8931/v1/chat/completions \
 - The free budget is per egress IP per day. Without a proxy pool the server will 429 after the direct IP's budget is spent (`Retry-After` points at the reset).
 - `harness.json` embeds the captured CLI system prompt and tool schemas. Tool names the model calls are the harness ones, not necessarily the caller's.
 - No tokens or credentials live in this repo; `Bearer public` is the anonymous free-tier credential the CLI itself sends.
+
+## 429 handling and rotation
+
+- A fresh `ses_…` id is minted for **every** request (device identity changes per call).
+- `--proxy` accepts a comma-separated list. On `429`, transport error (status 0) or `5xx`, the shim retries up to 3 times: it switches to the **next proxy** in the list and **regenerates the four session headers**, so the retry looks like a new device on a new IP. The last response is returned to the caller.
+- With a rotating proxy endpoint (one URL that itself rotates the exit IP per request) the list holds a single entry and each attempt still leaves from a different IP.
+- Not implemented: cross-request cooldown memory, per-model quota tracking, exponential backoff.
