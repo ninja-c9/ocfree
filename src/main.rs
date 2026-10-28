@@ -33,6 +33,9 @@ struct Cli {
     #[arg(long, default_value = "http://127.0.0.1:8899")]
     proxy: String,
 
+    #[arg(long)]
+    proxy_file: Option<String>,
+
     #[arg(long, default_value = "harness.json")]
     harness: String,
 
@@ -312,14 +315,10 @@ async fn chat_completions(
     };
 
     if status != 200 {
-        let body = serde_json::json!({
-            "error": {"message": upstream_body_str, "type": "upstream_error"}
-        });
-        return axum::response::Response::builder()
-            .status(status)
-            .header("content-type", "application/json")
-            .body(axum::body::Body::from(serde_json::to_string(&body).unwrap()))
-            .unwrap();
+        let body = serde_json::json!({ "error": {"message": upstream_body_str, "type": "upstream_error"} });
+        let mut builder = axum::response::Response::builder().status(status).header("content-type", "application/json");
+        if let Some(arr) = shim_res["headers"].as_array() { for h in arr { if let Some(pair) = h.as_array() { let name = pair.first().and_then(|v| v.as_str()).unwrap_or(""); let value = pair.get(1).and_then(|v| v.as_str()).unwrap_or(""); let lower = name.to_ascii_lowercase(); if lower == "retry-after" || lower == "x-opencode-log-id" || lower == "x-ratelimit-reset-after" { builder = builder.header(name, value); } } } }
+        return builder.body(axum::body::Body::from(serde_json::to_string(&body).unwrap())).unwrap();
     }
 
     if stream {
@@ -396,12 +395,23 @@ async fn main() -> Result<()> {
     let shim_port: u16 = 8941;
 
     // Spawn bun shim child process
+    let proxy_list = match &cli.proxy_file {
+        Some(path) => std::fs::read_to_string(path)
+            .with_context(|| format!("reading proxy file {path:?}"))?
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect::<Vec<_>>()
+            .join(","),
+        None => cli.proxy.clone(),
+    };
+
     let mut child = std::process::Command::new("bun")
         .arg("/storage/cyber/tools/ocfree/shim.mjs")
         .env("OCFREE_SHIM_PORT", "8941")
         .env("OCFREE_SHIM_TOKEN", &shim_token)
         .env("HTTPS_PROXY", &cli.proxy)
-        .env("OCFREE_PROXIES", &cli.proxy)
+        .env("OCFREE_PROXIES", &proxy_list)
         .env("OCFREE_RETRIES", "3")
         .spawn()
         .expect("failed to spawn shim");

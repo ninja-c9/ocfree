@@ -51,6 +51,7 @@ curl -s http://127.0.0.1:8931/v1/chat/completions \
 ## 429 handling and rotation
 
 - A fresh `ses_…` id is minted for **every** request (device identity changes per call).
-- `--proxy` accepts a comma-separated list. On `429`, transport error (status 0) or `5xx`, the shim retries up to 3 times: it switches to the **next proxy** in the list and **regenerates the four session headers**, so the retry looks like a new device on a new IP. The last response is returned to the caller.
+- `--proxy` accepts a comma-separated list, or `--proxy-file` with one proxy per line (`#` comments allowed). On `429`, transport error (status 0) or `5xx`, the shim retries up to 3 times: it switches to the **next proxy** and **regenerates the four session headers**, sleeping 500ms, 1s, 2s between attempts (`OCFREE_BACKOFF_MS`). The last response is returned to the caller.
 - With a rotating proxy endpoint (one URL that itself rotates the exit IP per request) the list holds a single entry and each attempt still leaves from a different IP.
-- Not implemented: cross-request cooldown memory, per-model quota tracking, exponential backoff.
+- When the final attempt is a 429, the HTTP status is passed through together with `retry-after`, `x-ratelimit-reset-after` and `x-opencode-log-id` from upstream.
+- Not implemented: cross-request cooldown memory, per-model quota tracking, proxy health scoring.

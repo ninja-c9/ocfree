@@ -3,6 +3,7 @@ const PORT = Number(process.env.OCFREE_SHIM_PORT || 8941);
 const TOKEN = process.env.OCFREE_SHIM_TOKEN || "";
 const HOST = "127.0.0.1";
 const RETRIES = Number(process.env.OCFREE_RETRIES || 3);
+const BACKOFF_MS = Number(process.env.OCFREE_BACKOFF_MS || 500);
 const PROXIES = String(process.env.OCFREE_PROXIES || process.env.HTTPS_PROXY || "")
   .split(",").map(s => s.trim()).filter(Boolean);
 
@@ -51,8 +52,10 @@ serve({
       } catch (e) {
         last = { status: 0, headers: [], body: String(e && e.message || e) };
       }
-      console.error(`${p.method || "POST"} ${p.url} via ${proxy || "direct"} -> ${last.status} (attempt ${attempt + 1})`);
-      if (!(last.status === 429 || last.status === 0 || last.status >= 500)) break;
+      console.error(`${new Date().toISOString()} ${p.method || "POST"} ${p.url} via ${proxy || "direct"} -> ${last.status} (attempt ${attempt + 1})`);
+      const retryable = last.status === 429 || last.status === 0 || last.status >= 500;
+      if (!retryable) break;
+      if (attempt < RETRIES) await new Promise(r => setTimeout(r, Math.round(BACKOFF_MS * 2 ** attempt)));
     }
     return Response.json(last);
   },
