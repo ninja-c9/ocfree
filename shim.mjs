@@ -48,6 +48,17 @@ const A = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 let lastMs = 0;
 let counter = 0;
 
+function newMessageId() {
+  const now = Date.now();
+  const hex = (~(BigInt(now) * 4096n + BigInt((counter % 16) + 1)) & ((1n << 48n) - 1n))
+    .toString(16)
+    .padStart(12, "0");
+  const bytes = crypto.getRandomValues(new Uint8Array(14));
+  let random = "";
+  for (const b of bytes) random += A[b % 62];
+  return "msg_" + hex + random;
+}
+
 function newSession() {
   const now = Date.now();
   if (now !== lastMs) {
@@ -141,7 +152,10 @@ serve({
     for (let attempt = 0; attempt <= RETRIES; attempt++) {
       const proxy = entry ? proxyOf(entry) : undefined;
       const headers = { ...(p.headers || {}) };
-      if (entry) for (const name of SESSION_HEADERS) headers[name] = entry.session;
+      if (entry) {
+        for (const name of SESSION_HEADERS) headers[name] = entry.session;
+        headers["x-opencode-request"] = newMessageId();
+      }
 
       let res = null;
       try {

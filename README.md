@@ -23,6 +23,7 @@ The same 429 code covers "harness check failed" and "quota exhausted"; shape err
 - Per conversation the shim **pins one `ses_…` id and one proxy**. Nothing changes while requests succeed, so quota accounting and the provider prompt cache stay stable.
 - On **429, transport error or 5xx** the conversation moves to the **next proxy and a freshly minted session id, together**. Up to `OCFREE_RETRIES` additional attempts, sleeping `OCFREE_BACKOFF_MS` × 2ⁿ. The final upstream response is returned to the caller as-is, including `retry-after`, `x-ratelimit-reset-after` and `x-opencode-log-id`.
 - Responses are streamed through untouched; `stream:false` requests are aggregated server-side into a `chat.completion`.
+- A 429 is per model on the free lane: in a local probe the official CLI was refused for `mimo-v2.6-flash-free` and served `big-pickle` from the same egress. Session rotation alone does not clear a model's daily budget.
 - With a single proxy URL the exit IP can only change if that endpoint rotates per request; a list of two or more entries is what makes the 429 failover change the IP as well. Pins live in the shim process, so a gateway restart mints fresh pairs.
 - `--proxy` takes a comma-separated list, or `--proxy-file` with one proxy per line (`#` comments allowed). With neither, the shim uses its own environment (`HTTPS_PROXY` / `NO_PROXY`), which is the normal setup behind an egress proxy.
 

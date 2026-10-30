@@ -17,8 +17,8 @@ use std::sync::Arc;
 
 // Must match the CLI that produced harness.json; override with --user-agent
 // (v2 CLI form is `opencode/<channel>/<version>/cli`).
-const DEFAULT_UA: &str = "opencode/1.19.4 ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4";
-const DEFAULT_UPSTREAM: &str = "https://opencode.ai/inference/v1/chat/completions";
+const DEFAULT_UA: &str = "opencode/1.19.5 ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4";
+const DEFAULT_UPSTREAM: &str = "https://opencode.ai/inference/openai/v1/chat/completions";
 const DEFAULT_MODELS_URLS: &[&str] = &[
     "https://opencode.ai/inference/v1/models",
     "https://opencode.ai/zen/v1/models",
@@ -474,8 +474,11 @@ fn models_urls(cli: &Cli) -> Vec<String> {
     if let Some(url) = &cli.models_url {
         return vec![url.clone()];
     }
-    let mut urls = vec![cli.upstream.replace("/chat/completions", "/models")];
-    urls.extend(DEFAULT_MODELS_URLS.iter().map(|url| url.to_string()));
+    let mut urls: Vec<String> = DEFAULT_MODELS_URLS.iter().map(|url| url.to_string()).collect();
+    let derived = cli.upstream.replace("/chat/completions", "/models");
+    if !urls.contains(&derived) {
+        urls.push(derived);
+    }
     urls.dedup();
     urls
 }
