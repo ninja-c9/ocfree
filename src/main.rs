@@ -1,25 +1,53 @@
+use anyhow::{bail, Context, Result};
 use axum::{
+    body::Body,
+    extract::State,
+    http::{header, HeaderMap, StatusCode},
+    response::Response,
     routing::{get, post},
     Json, Router,
-    extract::State,
-    http::HeaderMap,
 };
 use clap::Parser;
-use rand::Rng;
-use serde_json::Value;
-use anyhow::{Result, Context, bail};
+use serde_json::{json, Map, Value};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
+
+// Must match the CLI that produced harness.json; override with --user-agent
+// (v2 CLI form is `opencode/<channel>/<version>/cli`).
+const DEFAULT_UA: &str = "opencode/1.19.4 ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4";
+const DEFAULT_UPSTREAM: &str = "https://opencode.ai/inference/v1/chat/completions";
+const DEFAULT_MODELS_URLS: &[&str] = &[
+    "https://opencode.ai/inference/v1/models",
+    "https://opencode.ai/zen/v1/models",
+];
+// Headers describing the upstream connection rather than the payload.
+const DROP_HEADERS: &[&str] = &[
+    "content-encoding",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "upgrade",
+];
 
 struct AppStateData {
     harness_system: String,
     harness_tools: Value,
     model_ids: Vec<String>,
     reqwest_client: reqwest::Client,
-    shim_port: u16,
+    shim_url: String,
     shim_token: String,
     key: Option<String>,
     upstream: String,
+    models_urls: Vec<String>,
+    user_agent: String,
 }
 
 #[derive(Parser)]
@@ -30,356 +58,447 @@ struct Cli {
     #[arg(long)]
     key: Option<String>,
 
-    #[arg(long, default_value = "http://127.0.0.1:8899")]
+    /// Comma-separated proxy list handed to the shim. Empty means "use the
+    /// shim's own environment" (HTTPS_PROXY / NO_PROXY).
+    #[arg(long, default_value = "")]
     proxy: String,
 
+    /// One proxy per line, `#` comments allowed.
     #[arg(long)]
-    proxy_file: Option<String>,
+    proxy_file: Option<PathBuf>,
 
     #[arg(long, default_value = "harness.json")]
-    harness: String,
+    harness: PathBuf,
 
-    #[arg(long, default_value = "https://opencode.ai/inference/v1/chat/completions")]
+    /// Path to shim.mjs. Defaults to $OCFREE_SHIM, then beside the binary,
+    /// then the build checkout.
+    #[arg(long)]
+    shim: Option<PathBuf>,
+
+    /// 0 picks a free loopback port.
+    #[arg(long, default_value_t = 0)]
+    shim_port: u16,
+
+    #[arg(long, default_value = DEFAULT_UPSTREAM)]
     upstream: String,
+
+    /// Overrides where /v1/models is read from; defaults to the upstream's
+    /// /models plus the known Zen paths.
+    #[arg(long)]
+    models_url: Option<String>,
+
+    #[arg(long, default_value = DEFAULT_UA)]
+    user_agent: String,
 }
 
-fn generate_session_id() -> String {
-    let ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-    let hex_val = (!(ms * 0x1000 + 1)) & ((1u64 << 48) - 1);
-    let hex_part = format!("{:012x}", hex_val);
-    let base62_alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    let base62_part: String = (0..14)
-        .map(|_| {
-            let idx = rand::thread_rng().gen_range(0..62);
-            base62_alphabet.as_bytes()[idx] as char
-        })
-        .collect();
-    format!("ses_{}{}", hex_part, base62_part)
-}
-
-async fn call_shim(shim_port: u16, token: &str, body: &str, client: &reqwest::Client) -> Result<Value> {
-    let output = client
-        .post(&format!("http://127.0.0.1:{}", shim_port))
-        .header("Content-Type", "application/json")
-        .header("x-ocfree-token", token)
-        .body(body.to_string())
-        .send()
-        .await
-        .context("failed to call shim")?;
-    let text = output.text().await.context("shim non-text")?;
-    let json: Value = serde_json::from_str(&text).context("shim non-JSON")?;
-    Ok(json)
-}
-
-async fn wait_for_health(shim_port: u16, timeout_secs: u64) -> Result<()> {
-    let start = std::time::Instant::now();
-    let timeout = std::time::Duration::from_secs(timeout_secs);
-    loop {
-        if start.elapsed() > timeout {
-            bail!("Timed out waiting for shim /health after {}s", timeout_secs);
+fn conversation_key(headers: &HeaderMap, payload: &Value) -> String {
+    for name in [
+        "x-session-id",
+        "x-opencode-session-id",
+        "x-opencode-session",
+        "x-session-affinity",
+        "x-conversation-id",
+    ] {
+        let value = headers
+            .get(name)
+            .and_then(|h| h.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if let Some(value) = value {
+            let mut hasher = DefaultHasher::new();
+            value.hash(&mut hasher);
+            return format!("h:{:016x}", hasher.finish());
         }
-        let output = reqwest::Client::new()
-            .get(&format!("http://127.0.0.1:{}/health", shim_port))
-            .send()
-            .await
-            .context("failed to check shim health")?;
-        let status = output.status().as_u16();
-        if status == 200 { return Ok(()); }
-        std::thread::sleep(std::time::Duration::from_millis(500));
     }
+
+    // No identity header: the conversation is the model plus its opening
+    // system/user turn, both of which stay put as the transcript grows.
+    let mut seed = String::new();
+    if let Some(model) = payload.get("model").and_then(Value::as_str) {
+        seed.push_str(model);
+    }
+    if let Some(messages) = payload.get("messages").and_then(Value::as_array) {
+        for msg in messages.iter().filter(|msg| msg["role"] == "system").take(1) {
+            seed.push('\u{0}');
+            seed.push_str(msg["content"].as_str().unwrap_or(""));
+        }
+        for msg in messages.iter().filter(|msg| msg["role"] == "user").take(1) {
+            seed.push('\u{0}');
+            seed.push_str(msg["content"].as_str().unwrap_or(""));
+        }
+    }
+    let mut hasher = DefaultHasher::new();
+    seed.hash(&mut hasher);
+    format!("b:{:016x}", hasher.finish())
 }
 
-fn build_chat_completion(content: String, usage: Option<Value>) -> Value {
-    serde_json::json!({
-        "id": "chatcmpl-123",
+fn upstream_body(state: &AppStateData, payload: &Value) -> Result<String> {
+    let mut messages = Vec::new();
+    let caller = payload
+        .get("messages")
+        .and_then(Value::as_array)
+        .context("messages missing")?;
+    // The harness prompt is the gate's, not the caller's: one system message.
+    messages.push(json!({ "role": "system", "content": state.harness_system }));
+    messages.extend(
+        caller
+            .iter()
+            .filter(|msg| msg["role"] != "system")
+            .cloned(),
+    );
+
+    let model = payload.get("model").and_then(Value::as_str).unwrap_or("");
+    // Key order mirrors the CLI's JSON.stringify, which the gate reads.
+    let mut body = Map::new();
+    body.insert("model".into(), json!(model.strip_prefix("oc/").unwrap_or(model)));
+    body.insert("messages".into(), Value::Array(messages));
+    body.insert("tools".into(), state.harness_tools.clone());
+    body.insert("stream".into(), json!(true));
+    body.insert("max_completion_tokens".into(), json!(32000));
+    body.insert("tool_choice".into(), json!("auto"));
+    Ok(Value::Object(body).to_string())
+}
+
+fn forward_headers(builder: axum::http::response::Builder, headers: &HeaderMap) -> axum::http::response::Builder {
+    let mut builder = builder;
+    for (name, value) in headers.iter() {
+        let lower = name.as_str().to_ascii_lowercase();
+        if DROP_HEADERS.contains(&lower.as_str()) {
+            continue;
+        }
+        if !(lower.starts_with("x-ratelimit") || lower.starts_with("x-ocfree") || lower == "retry-after" || lower == "x-opencode-log-id") {
+            continue;
+        }
+        builder = builder.header(name, value);
+    }
+    builder
+}
+
+fn error_response(status: StatusCode, message: impl Into<String>, headers: Option<&HeaderMap>) -> Response {
+    let body = json!({ "error": { "message": message.into(), "type": "upstream_error" } });
+    let builder = Response::builder().status(status).header(header::CONTENT_TYPE, "application/json");
+    let builder = match headers {
+        Some(headers) => forward_headers(builder, headers),
+        None => builder,
+    };
+    builder.body(Body::from(body.to_string())).unwrap()
+}
+
+fn aggregate_sse(sse: &str) -> Value {
+    let mut content = String::new();
+    let mut calls: Vec<ToolCallAcc> = Vec::new();
+    let mut finish_reason: Option<String> = None;
+    let mut usage: Option<Value> = None;
+
+    for line in sse.lines() {
+        let Some(data) = line.trim().strip_prefix("data: ") else { continue };
+        if data == "[DONE]" { continue }
+        let Ok(chunk) = serde_json::from_str::<Value>(data) else { continue };
+        if chunk["usage"].is_object() {
+            usage = Some(chunk["usage"].clone());
+        }
+        let Some(choice) = chunk["choices"].get(0) else { continue };
+        if let Some(text) = choice["delta"]["content"].as_str() {
+            content.push_str(text);
+        }
+        if let Some(deltas) = choice["delta"]["tool_calls"].as_array() {
+            for delta in deltas {
+                let index = delta["index"].as_u64().unwrap_or(0) as usize;
+                if calls.len() <= index {
+                    calls.resize(index + 1, ToolCallAcc::default());
+                }
+                let call = &mut calls[index];
+                if let Some(id) = delta["id"].as_str() {
+                    call.id.push_str(id);
+                }
+                if let Some(name) = delta["function"]["name"].as_str() {
+                    call.name.push_str(name);
+                }
+                if let Some(args) = delta["function"]["arguments"].as_str() {
+                    call.arguments.push_str(args);
+                }
+            }
+        }
+        if let Some(reason) = choice["finish_reason"].as_str() {
+            finish_reason = Some(reason.to_string());
+        }
+    }
+
+    let mut message = Map::new();
+    message.insert("role".into(), json!("assistant"));
+    message.insert(
+        "content".into(),
+        if content.is_empty() { Value::Null } else { json!(content) },
+    );
+    if !calls.is_empty() {
+        let tool_calls: Vec<Value> = calls
+            .iter()
+            .enumerate()
+            .map(|(index, call)| {
+                json!({
+                    "id": if call.id.is_empty() { format!("call_{index}") } else { call.id.clone() },
+                    "type": "function",
+                    "function": {
+                        "name": call.name,
+                        "arguments": if call.arguments.is_empty() { "{}" } else { call.arguments.as_str() },
+                    },
+                })
+            })
+            .collect();
+        message.insert("tool_calls".into(), Value::Array(tool_calls));
+    }
+
+    json!({
+        "id": "chatcmpl-ocfree",
         "object": "chat.completion",
         "created": std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs(),
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
+        "model": "",
+        "choices": [{
+            "index": 0,
+            "message": Value::Object(message),
+            "finish_reason": finish_reason.unwrap_or_else(|| "stop".to_string()),
+        }],
         "usage": usage,
     })
 }
 
-async fn fetch_models_through_shim(shim_port: u16, token: &str, client: &reqwest::Client) -> Result<Vec<String>> {
-    let body = serde_json::json!({
-        "url": "https://opencode.ai/zen/v1/models",
-        "method": "GET",
-        "headers": {"authorization": "Bearer public"},
-        "body": ""
-    });
-    let shim_res = call_shim(shim_port, token, &body.to_string(), client).await
-        .context("failed to fetch models through shim")?;
-    let status = shim_res["status"].as_u64().unwrap_or(0) as u16;
-    if status != 200 {
-        bail!("Shim returned status {}", status);
-    }
-    let text = shim_res["body"].as_str().context("no body from shim")?;
-    let models_json: Value = serde_json::from_str(text)
-        .context("failed to parse models JSON")?;
-    let data = models_json["data"].as_array().context("no data in models")?;
-    let mut ids = Vec::new();
-    for item in data {
-        let id = item["id"].as_str().context("model id missing")?.to_string();
-        ids.push(id);
-    }
-    Ok(ids)
+#[derive(Clone, Default)]
+struct ToolCallAcc {
+    id: String,
+    name: String,
+    arguments: String,
 }
 
-async fn parse_sse_lines(sse_text: &str, extract_content: bool) -> (Option<String>, Option<String>, Option<Value>) {
-    let mut full_content: Option<String> = None;
-    let mut finish_reason: Option<String> = None;
-    let mut usage: Option<Value> = None;
-    
-    for line in sse_text.lines() {
-        let line = line.trim();
-        if line.is_empty() { continue; }
-        if line == "[DONE]" { continue; }
-        if !line.starts_with("data: ") { continue; }
-        let data_str = &line[6..];
-        let data: Value = match serde_json::from_str(data_str) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if extract_content {
-            if let Some(choices) = data.get("choices").and_then(|c| c.as_array()) {
-                if let Some(first) = choices.first() {
-                    if let Some(delta) = first.get("delta").and_then(|d| d.as_object()) {
-                        if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
-                            full_content = Some(content.to_string());
-                        }
-                    }
-                    if let Some(fr) = first.get("finish_reason").and_then(|f| f.as_str()) {
-                        finish_reason = Some(fr.to_string());
-                    }
-                }
-            }
-        }
-        if let Some(usage_val) = data.get("usage") {
-            usage = Some(usage_val.clone());
-        }
+async fn healthz(State(state): State<Arc<AppStateData>>) -> Json<Value> {
+    Json(json!({ "ok": true, "models": state.model_ids.len() }))
+}
+
+fn authorized(state: &AppStateData, headers: &HeaderMap) -> bool {
+    match &state.key {
+        None => true,
+        Some(key) => headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .is_some_and(|provided| provided == key),
     }
-    (full_content, finish_reason, usage)
 }
 
-fn parse_sse_for_stream(sse_text: &str) -> String {
-    let mut chunks = Vec::new();
-    for line in sse_text.lines() {
-        let line = line.trim();
-        if line.is_empty() { continue; }
-        if line == "[DONE]" { continue; }
-        if !line.starts_with("data: ") { continue; }
-        let data_str = &line[6..];
-        let data: Value = match serde_json::from_str(data_str) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if let Some(choices) = data.get("choices").and_then(|c| c.as_array()) {
-            if let Some(first) = choices.first() {
-                if let Some(delta) = first.get("delta").and_then(|d| d.as_object()) {
-                    if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
-                        chunks.push(content.to_string());
-                    }
-                }
-            }
-        }
+async fn models_handler(
+    State(state): State<Arc<AppStateData>>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if !authorized(&state, &headers) {
+        return error_response(StatusCode::UNAUTHORIZED, "invalid bearer token", None);
     }
-    chunks.join("")
-}
-
-async fn healthz() -> Json<Value> {
-    Json(serde_json::json!({ "ok": true }))
-}
-
-async fn models_handler(State(state): State<Arc<AppStateData>>) -> Json<Value> {
-    let data: Vec<Value> = state.model_ids.iter()
-        .map(|id| serde_json::json!({ "id": id }))
+    let data: Vec<Value> = state
+        .model_ids
+        .iter()
+        .map(|id| json!({ "id": id.clone(), "object": "model" }))
         .collect();
-    Json(serde_json::json!({
-        "object": "list",
-        "data": data,
-    }))
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({ "object": "list", "data": data }).to_string()))
+        .unwrap()
 }
 
 async fn chat_completions(
     State(state): State<Arc<AppStateData>>,
     headers: HeaderMap,
     Json(payload): Json<Value>,
-) -> axum::response::Response {
-    // Bearer check from HeaderMap
-    if let Some(key) = &state.key {
-        let auth_val = headers
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|h| h.to_str().ok())
-            .and_then(|a| a.strip_prefix("Bearer "))
-            .or_else(|| headers.get(axum::http::header::AUTHORIZATION).and_then(|h| h.to_str().ok()));
-        if let Some(auth) = auth_val {
-            if auth != *key {
-                let body = serde_json::json!({
-                    "error": {"message": "invalid bearer token", "type": "invalid_token"}
-                });
-                return axum::response::Response::builder()
-                    .status(401)
-                    .header("content-type", "application/json")
-                    .body(axum::body::Body::from(serde_json::to_string(&body).unwrap()))
-                    .unwrap();
-            }
-        }
+) -> Response {
+    if !authorized(&state, &headers) {
+        return error_response(StatusCode::UNAUTHORIZED, "invalid bearer token", None);
     }
 
-    let stream = payload.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
-    let model = payload.get("model").and_then(|m| m.as_str()).unwrap_or("");
-    let model_id = model.strip_prefix("oc/").unwrap_or(model);
+    let stream = payload.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let body = match upstream_body(&state, &payload) {
+        Ok(body) => body,
+        Err(error) => return error_response(StatusCode::BAD_REQUEST, error.to_string(), None),
+    };
+    let conv = conversation_key(&headers, &payload);
 
-    // Strip system messages from caller, keep harness system
-    let mut messages = Vec::new();
-    if let Some(msg_array) = payload.get("messages").and_then(|m| m.as_array()) {
-        messages.push(serde_json::json!({
-            "role": "system",
-            "content": state.harness_system
-        }));
-        for msg in msg_array {
-            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
-            if role != "system" {
-                messages.push(msg.clone());
-            }
-        }
-    }
-
-    // Build upstream body
-    let upstream_model = model_id;
-    let upstream_body = serde_json::json!({
-        "model": upstream_model,
-        "stream": true,
-        "max_tokens": 32000,
-        "messages": messages,
-        "tools": state.harness_tools,
-        "tool_choice": "auto",
-    });
-
-    let body_str = upstream_body.to_string();
-
-    // Generate fresh session id per request
-    let session_id = generate_session_id();
-
-    // Build envelope for shim
-    let envelope = serde_json::json!({
+    // Session id and proxy are pinned by the shim per conversation; it rotates
+    // both only when upstream answers 429.
+    let envelope = json!({
         "url": state.upstream,
         "method": "POST",
+        "conv": conv,
         "headers": {
             "authorization": "Bearer public",
             "content-type": "application/json",
-            "user-agent": "opencode/1.19.4 ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4",
+            "accept": "text/event-stream",
+            "user-agent": state.user_agent,
             "x-opencode-client": "cli",
             "x-opencode-project": "global",
-            "x-opencode-session": session_id,
-            "x-opencode-session-id": session_id,
-            "x-session-affinity": session_id,
-            "x-session-id": session_id,
         },
-        "body": body_str,
+        "body": body,
     });
-    let envelope_str = envelope.to_string();
 
-    // Call shim with envelope
-    let shim_res = match call_shim(state.shim_port, &state.shim_token, &envelope_str, &state.reqwest_client).await {
-        Ok(v) => v,
-        Err(e) => {
-            let body = serde_json::json!({
-                "error": {"message": e.to_string(), "type": "shim_error"}
-            });
-            return axum::response::Response::builder()
-                .status(500)
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(serde_json::to_string(&body).unwrap()))
-                .unwrap();
-        }
-    };
-    let status = shim_res["status"].as_u64().unwrap_or(0) as u16;
-    let upstream_body_str = match shim_res["body"].as_str() {
-        Some(s) => s.to_string(),
-        None => {
-            let body = serde_json::json!({
-                "error": {"message": "no body from shim", "type": "shim_error"}
-            });
-            return axum::response::Response::builder()
-                .status(500)
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(serde_json::to_string(&body).unwrap()))
-                .unwrap();
-        }
+    let upstream = match state
+        .reqwest_client
+        .post(&state.shim_url)
+        .header("x-ocfree-token", &state.shim_token)
+        .json(&envelope)
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => return error_response(StatusCode::BAD_GATEWAY, error.to_string(), None),
     };
 
-    if status != 200 {
-        let body = serde_json::json!({ "error": {"message": upstream_body_str, "type": "upstream_error"} });
-        let mut builder = axum::response::Response::builder().status(status).header("content-type", "application/json");
-        if let Some(arr) = shim_res["headers"].as_array() { for h in arr { if let Some(pair) = h.as_array() { let name = pair.first().and_then(|v| v.as_str()).unwrap_or(""); let value = pair.get(1).and_then(|v| v.as_str()).unwrap_or(""); let lower = name.to_ascii_lowercase(); if lower == "retry-after" || lower == "x-opencode-log-id" || lower == "x-ratelimit-reset-after" { builder = builder.header(name, value); } } } }
-        return builder.body(axum::body::Body::from(serde_json::to_string(&body).unwrap())).unwrap();
+    let status = upstream.status();
+    if status != StatusCode::OK {
+        let headers = upstream.headers().clone();
+        let body = upstream.text().await.unwrap_or_default();
+        return error_response(status, body, Some(&headers));
     }
 
     if stream {
-        let mut resp = axum::response::Response::builder()
-            .status(200)
-            .header("content-type", "text/event-stream")
-            .body(axum::body::Body::from(upstream_body_str))
+        let builder = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header(header::CACHE_CONTROL, "no-cache");
+        let builder = forward_headers(builder, upstream.headers());
+        return builder
+            .body(Body::from_stream(upstream.bytes_stream()))
             .unwrap();
-        return resp;
-    } else {
-        // Aggregate SSE by appending every choices[0].delta.content (fix overwrite)
-        let mut full_content = String::new();
-        let mut usage: Option<Value> = None;
-        let mut finish_reason = None;
-        
-        for line in upstream_body_str.lines() {
-            let line = line.trim();
-            if line.is_empty() { continue; }
-            if line == "[DONE]" { continue; }
-            if !line.starts_with("data: ") { continue; }
-            let data_str = &line[6..];
-            let data: Value = match serde_json::from_str(data_str) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            if let Some(choices) = data.get("choices").and_then(|c| c.as_array()) {
-                if let Some(first) = choices.first() {
-                    if let Some(delta) = first.get("delta").and_then(|d| d.as_object()) {
-                        if let Some(c) = delta.get("content").and_then(|c| c.as_str()) {
-                            full_content.push_str(c);
-                        }
-                    }
-                    if let Some(fr) = first.get("finish_reason").and_then(|f| f.as_str()) {
-                        finish_reason = Some(fr.to_string());
-                    }
-                }
+    }
+
+    let sse = upstream.text().await.unwrap_or_default();
+    let completion = aggregate_sse(&sse);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(completion.to_string()))
+        .unwrap()
+}
+
+async fn fetch_models(state: &AppStateData) -> Result<Vec<String>> {
+    let mut last_error = None;
+    for url in &state.models_urls {
+        let envelope = json!({
+            "url": url,
+            "method": "GET",
+            "headers": { "authorization": "Bearer public" },
+            "body": "",
+        });
+        let result = state
+            .reqwest_client
+            .post(&state.shim_url)
+            .header("x-ocfree-token", &state.shim_token)
+            .json(&envelope)
+            .send()
+            .await;
+        let response = match result {
+            Ok(response) => response,
+            Err(error) => {
+                last_error = Some(error.to_string());
+                continue;
             }
-            if let Some(usage_val) = data.get("usage") {
-                usage = Some(usage_val.clone());
+        };
+        if response.status() != StatusCode::OK {
+            last_error = Some(format!("{url} answered {}", response.status()));
+            continue;
+        }
+        let text = response.text().await.context("models body")?;
+        let models: Value = serde_json::from_str(&text).context("models JSON")?;
+        let ids = models["data"]
+            .as_array()
+            .context("no data in models")?
+            .iter()
+            .filter_map(|item| item["id"].as_str().map(str::to_string))
+            .collect();
+        return Ok(ids);
+    }
+    bail!("{}", last_error.unwrap_or_else(|| "no models endpoint".to_string()))
+}
+
+async fn wait_for_shim(shim_url: &str, token: &str) -> Result<()> {
+    let client = reqwest::Client::new();
+    for _ in 0..40 {
+        if let Ok(response) = client
+            .get(format!("{shim_url}/health"))
+            .header("x-ocfree-token", token)
+            .send()
+            .await
+        {
+            if response.status() == StatusCode::OK {
+                return Ok(());
             }
         }
-        
-        let completion = serde_json::json!({
-            "id": "chatcmpl-123",
-            "object": "chat.completion",
-            "created": std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": full_content}, "finish_reason": finish_reason.clone().unwrap_or_else(|| "stop".to_string())}],
-            "usage": usage,
-        });
-        
-        let body = serde_json::to_string(&completion).unwrap();
-        let mut resp = axum::response::Response::builder()
-            .status(200)
-            .header("content-type", "application/json")
-            .body(axum::body::Body::from(body))
-            .unwrap();
-        return resp;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
+    bail!("timed out waiting for the shim on {shim_url}/health")
+}
+
+fn pick_port() -> Result<u16> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+    Ok(listener.local_addr()?.port())
+}
+
+fn resolve_shim(cli: &Cli) -> Result<PathBuf> {
+    if let Some(path) = &cli.shim {
+        return Ok(path.clone());
+    }
+    if let Ok(path) = std::env::var("OCFREE_SHIM") {
+        return Ok(PathBuf::from(path));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let beside = dir.join("shim.mjs");
+            if beside.exists() {
+                return Ok(beside);
+            }
+            // target/release/ocfree -> checkout root
+            if let Some(root) = dir.parent().and_then(|dir| dir.parent()) {
+                let checkout = root.join("shim.mjs");
+                if checkout.exists() {
+                    return Ok(checkout);
+                }
+            }
+        }
+    }
+    let checkout = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("shim.mjs");
+    if checkout.exists() {
+        return Ok(checkout);
+    }
+    bail!("shim.mjs not found; pass --shim")
+}
+
+fn models_urls(cli: &Cli) -> Vec<String> {
+    if let Some(url) = &cli.models_url {
+        return vec![url.clone()];
+    }
+    let mut urls = vec![cli.upstream.replace("/chat/completions", "/models")];
+    urls.extend(DEFAULT_MODELS_URLS.iter().map(|url| url.to_string()));
+    urls.dedup();
+    urls
+}
+
+fn proxy_list(cli: &Cli) -> Result<Vec<String>> {
+    let mut proxies: Vec<String> = cli
+        .proxy
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect();
+    if let Some(path) = &cli.proxy_file {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("reading proxy file {path:?}"))?;
+        proxies.extend(
+            text.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .map(str::to_string),
+        );
+    }
+    Ok(proxies)
 }
 
 #[tokio::main]
@@ -388,98 +507,64 @@ async fn main() -> Result<()> {
 
     let harness_str = std::fs::read_to_string(&cli.harness)
         .with_context(|| format!("reading {:?}", cli.harness))?;
-    let harness: Value = serde_json::from_str(&harness_str).with_context(|| "parsing harness JSON")?;
-    let _system_check = harness["system"].as_str().context("harness missing system")?;
+    let harness: Value = serde_json::from_str(&harness_str).context("parsing harness JSON")?;
+    let harness_system = harness["system"].as_str().context("harness missing system")?;
+    let harness_tools = harness["tools"].clone();
 
-    let shim_token: String = format!("{:032x}", rand::random::<u64>());
-    let shim_port: u16 = 8941;
+    let shim_path = resolve_shim(&cli)?;
+    let shim_port = if cli.shim_port == 0 { pick_port()? } else { cli.shim_port };
+    let shim_token = format!("{:032x}", rand::random::<u64>());
+    let proxies = proxy_list(&cli)?;
 
-    // Spawn bun shim child process
-    let proxy_list = match &cli.proxy_file {
-        Some(path) => std::fs::read_to_string(path)
-            .with_context(|| format!("reading proxy file {path:?}"))?
-            .lines()
-            .map(|l| l.trim())
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            .collect::<Vec<_>>()
-            .join(","),
-        None => cli.proxy.clone(),
-    };
-
-    let mut child = std::process::Command::new("bun")
-        .arg("/storage/cyber/tools/ocfree/shim.mjs")
-        .env("OCFREE_SHIM_PORT", "8941")
+    let bun = std::env::var("OCFREE_BUN").unwrap_or_else(|_| "bun".to_string());
+    let mut command = std::process::Command::new(bun);
+    command
+        .arg(&shim_path)
+        .env("OCFREE_SHIM_PORT", shim_port.to_string())
         .env("OCFREE_SHIM_TOKEN", &shim_token)
-        .env("HTTPS_PROXY", &cli.proxy)
-        .env("OCFREE_PROXIES", &proxy_list)
-        .env("OCFREE_RETRIES", "3")
+        .env("OCFREE_RETRIES", "3");
+    if !proxies.is_empty() {
+        command.env("OCFREE_PROXIES", proxies.join(","));
+    }
+    let mut child = command
         .spawn()
-        .expect("failed to spawn shim");
+        .with_context(|| format!("spawning bun {shim_path:?}"))?;
 
-    // Poll health endpoint up to 8s
-    let timeout = std::time::Duration::from_secs(8);
-    let start = std::time::Instant::now();
-    loop {
-        if start.elapsed() > timeout {
-            bail!("Timed out waiting for shim /health after 8s");
-        }
-        match reqwest::Client::new()
-            .get(&format!("http://127.0.0.1:8941/health"))
-            .send()
-            .await
-        {
-            Ok(resp) => {
-                if resp.status() == 200 { break; }
-            }
-            Err(_) => {}
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let shim_url = format!("http://127.0.0.1:{shim_port}");
+    if let Err(error) = wait_for_shim(&shim_url, &shim_token).await {
+        let _ = child.kill();
+        return Err(error);
     }
 
-    // Build reqwest client
-    let reqwest_client = {
-        let client = reqwest::Client::builder()
-            .build()
-            .expect("reqwest client build");
-        client
-    };
-
+    let model_endpoints = models_urls(&cli);
     let mut state = AppStateData {
-        harness_system: harness["system"].as_str().unwrap_or("").to_string(),
-        harness_tools: harness["tools"].clone(),
+        harness_system: harness_system.to_string(),
+        harness_tools,
         model_ids: Vec::new(),
-        reqwest_client,
-        shim_port,
-        shim_token: shim_token.clone(),
+        reqwest_client: reqwest::Client::builder()
+            .build()
+            .context("reqwest client build")?,
+        shim_url,
+        shim_token,
         key: cli.key,
-        upstream: cli.upstream,
+        upstream: cli.upstream.clone(),
+        models_urls: model_endpoints,
+        user_agent: cli.user_agent,
     };
 
-    // Fetch models through shim
-    let fetched_ids = fetch_models_through_shim(shim_port, &state.shim_token, &state.reqwest_client).await
-        .unwrap_or_else(|_| {
-            vec![
-                "mimo-v2.6-flash-free".to_string(),
-                "deepseek-v4.1-flash-free".to_string(),
-                "jev-1.13-free".to_string(),
-            ]
-        });
-    for id in &fetched_ids {
-        state.model_ids.push(format!("oc/{}", id));
+    match fetch_models(&state).await {
+        Ok(models) => state.model_ids = models,
+        Err(error) => eprintln!("models unavailable at startup: {error}"),
     }
 
-    let arc_state = Arc::new(state);
     let router = Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/models", get(models_handler))
-        .with_state(arc_state.clone());
+        .with_state(Arc::new(state));
 
     let listener = tokio::net::TcpListener::bind(cli.bind).await?;
-    axum::serve(listener, router).await?;
-
-    // Kill child on exit
+    let result = axum::serve(listener, router).await;
     let _ = child.kill();
-
-    Ok(())
+    result.map_err(Into::into)
 }

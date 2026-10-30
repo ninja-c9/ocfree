@@ -3,37 +3,39 @@
 Minimal OpenAI-compatible gateway for opencode.ai's free models. Rust (axum) HTTP server plus a tiny Bun transport shim.
 
 ```
-client ──/v1/chat/completions──► ocfree (Rust) ──{url,headers,body}──► shim (bun) ──HTTPS_PROXY──► opencode.ai
+client ──/v1/chat/completions──► ocfree (Rust) ──{url,headers,body,conv}──► shim (bun) ──proxy/env──► opencode.ai
 ```
 
 ## Why a Bun shim
 
-opencode's free tier answers `429 FreeUsageLimitError` to a request unless **all** of these hold:
+opencode's free tier answers `429 FreeUsageLimitError` unless the request also looks like the official CLI:
 
-1. the body carries the official CLI harness — the exact 27.5 KB system prompt with an `<env>` block (`Working directory:` + `Workspace root folder:`) and the exact 11-tool array (`harness.json`, captured from CLI traffic);
-2. headers look like the CLI: `authorization: Bearer public`, `user-agent: opencode/1.19.4 ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4`, `x-opencode-client: cli`, `x-opencode-project: global`, and a valid session id (`ses_` + 12 hex of `~(ms*0x1000+1) & (2^48-1)` + 14 base62) repeated in `x-opencode-session`, `x-opencode-session-id`, `x-session-affinity`, `x-session-id`;
-3. the TLS client is Bun/BoringSSL and the egress IP still has free quota for the day.
+1. the body carries the captured CLI harness — the system prompt with its `<env>` block (`Working directory:` + `Workspace root folder:`) and the CLI's own tool definitions (`harness.json`);
+2. headers look like the CLI: `authorization: Bearer public`, `user-agent: opencode/…`, `x-opencode-client: cli`, `x-opencode-project: global` (a `prj_` id is refused with 403), and one session id (`ses_` + 12 hex + 14 base62) repeated in `x-opencode-session`, `x-opencode-session-id`, `x-session-affinity`, `x-session-id`;
+3. the TLS client is Bun/BoringSSL — the gate keys on the ClientHello cipher list, so rustls, Node and curl get 429 even with a byte-identical request;
+4. the egress IP still has free quota for the day.
 
-rustls, Node and curl all get 429 even with a byte-identical request. So the Rust server builds the request and hands it to `shim.mjs` (60 lines, `bun` `fetch`), which runs with `HTTPS_PROXY` pointing at a rotating proxy so each request leaves from an IP with quota left.
+The same 429 code covers "harness check failed" and "quota exhausted"; shape errors usually answer 403 `FreeTierError` instead.
 
-The same 429 code is used for "failed harness check" and "quota exhausted"; a syntactically valid `ses_` id and the harness body are the difference between the two.
+## 429 handling: pin, then rotate both
+
+- A **conversation key** is derived from the caller's identity header (`x-session-id`, `x-opencode-session-id`, `x-opencode-session`, `x-session-affinity`, `x-conversation-id`), otherwise from the model plus the opening system/user turn.
+- Per conversation the shim **pins one `ses_…` id and one proxy**. Nothing changes while requests succeed, so quota accounting and the provider prompt cache stay stable.
+- On **429, transport error or 5xx** the conversation moves to the **next proxy and a freshly minted session id, together**. Up to `OCFREE_RETRIES` additional attempts, sleeping `OCFREE_BACKOFF_MS` × 2ⁿ. The final upstream response is returned to the caller as-is, including `retry-after`, `x-ratelimit-reset-after` and `x-opencode-log-id`.
+- Responses are streamed through untouched; `stream:false` requests are aggregated server-side into a `chat.completion`.
+- `--proxy` takes a comma-separated list, or `--proxy-file` with one proxy per line (`#` comments allowed). With neither, the shim uses its own environment (`HTTPS_PROXY` / `NO_PROXY`), which is the normal setup behind an egress proxy.
 
 ## Build and run
 
 ```bash
 cargo build --release
-./target/release/ocfree --bind 127.0.0.1:8931 --proxy http://127.0.0.1:8899
+./target/release/ocfree --bind 127.0.0.1:8931
 ```
 
-Flags: `--bind`, `--proxy` (passed to the shim as `HTTPS_PROXY`), `--harness` (default `harness.json`), `--upstream`, `--key` (optional bearer to protect the local API).
-
-## API
-
-| Endpoint | Notes |
-|---|---|
-| `POST /v1/chat/completions` | OpenAI schema. `stream:true` forwards SSE; `stream:false` aggregates into a `chat.completion`. Model ids: `oc/<id>`. |
-| `GET /v1/models` | Free model list, fetched from `/zen/v1/models` at startup. |
-| `GET /healthz` | `{"ok":true}` |
+Flags: `--bind`, `--key` (optional bearer to protect the local API), `--proxy`, `--proxy-file`,
+`--harness` (default `harness.json`), `--shim` (default: `$OCFREE_SHIM`, then beside the binary,
+then the build checkout), `--shim-port` (default `0` = free loopback port), `--models-url`,
+`--upstream`, `--user-agent`. `OCFREE_BUN` selects the bun binary.
 
 ```bash
 curl -s http://127.0.0.1:8931/v1/chat/completions \
@@ -43,15 +45,6 @@ curl -s http://127.0.0.1:8931/v1/chat/completions \
 
 ## Caveats
 
-- This impersonates the official client to pass its own gate. Upstream changes can break it at any time; when that happens the error is usually a 429 that looks like quota exhaustion.
-- The free budget is per egress IP per day. Without a proxy pool the server will 429 after the direct IP's budget is spent (`Retry-After` points at the reset).
-- `harness.json` embeds the captured CLI system prompt and tool schemas. Tool names the model calls are the harness ones, not necessarily the caller's.
-- No tokens or credentials live in this repo; `Bearer public` is the anonymous free-tier credential the CLI itself sends.
-
-## 429 handling and rotation
-
-- A fresh `ses_…` id is minted for **every** request (device identity changes per call).
-- `--proxy` accepts a comma-separated list, or `--proxy-file` with one proxy per line (`#` comments allowed). On `429`, transport error (status 0) or `5xx`, the shim retries up to 3 times: it switches to the **next proxy** and **regenerates the four session headers**, sleeping 500ms, 1s, 2s between attempts (`OCFREE_BACKOFF_MS`). The last response is returned to the caller.
-- With a rotating proxy endpoint (one URL that itself rotates the exit IP per request) the list holds a single entry and each attempt still leaves from a different IP.
-- When the final attempt is a 429, the HTTP status is passed through together with `retry-after`, `x-ratelimit-reset-after` and `x-opencode-log-id` from upstream.
-- Not implemented: cross-request cooldown memory, per-model quota tracking, proxy health scoring.
+- The free budget is per egress IP (daily) and per session id. Without a proxy pool the server 429s once the direct IP's budget is spent; `retry-after` points at the reset.
+- `harness.json` embeds the captured CLI system prompt and tool schemas, so the model calls the harness' tools, not necessarily the caller's. Re-capture it when upstream changes; a stale harness looks exactly like quota exhaustion.
+- The `user-agent` must stay in step with the captured CLI (`--user-agent`), the same way the version is pinned in the harness.
