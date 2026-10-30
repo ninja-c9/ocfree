@@ -184,7 +184,7 @@ fn error_response(status: StatusCode, message: impl Into<String>, headers: Optio
     builder.body(Body::from(body.to_string())).unwrap()
 }
 
-fn aggregate_sse(sse: &str) -> Value {
+fn aggregate_sse(sse: &str, model: &str) -> Value {
     let mut content = String::new();
     let mut calls: Vec<ToolCallAcc> = Vec::new();
     let mut finish_reason: Option<String> = None;
@@ -255,7 +255,7 @@ fn aggregate_sse(sse: &str) -> Value {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs(),
-        "model": "",
+        "model": model,
         "choices": [{
             "index": 0,
             "message": Value::Object(message),
@@ -370,7 +370,7 @@ async fn chat_completions(
     }
 
     let sse = upstream.text().await.unwrap_or_default();
-    let completion = aggregate_sse(&sse);
+    let completion = aggregate_sse(&sse, payload.get("model").and_then(Value::as_str).unwrap_or(""));
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/json")
