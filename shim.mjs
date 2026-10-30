@@ -192,10 +192,10 @@ serve({
         }
       }
 
-      // Only a 429 (or a dead connection / 5xx) moves the conversation: the
-      // next attempt, and every later request, uses a new session AND the next
-      // proxy. A successful conversation never leaves its pair.
-      if (entry) {
+      // Only a 429 moves the conversation: the next attempt, and every later
+      // request, uses a new session AND the next proxy. A dead connection or a
+      // 5xx is retried on the same pinned pair.
+      if (entry && status === 429) {
         entry.session = newSession();
         if (PROXIES.length) entry.proxy = (entry.proxy + 1) % PROXIES.length;
       }
